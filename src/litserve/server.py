@@ -22,6 +22,7 @@ import shutil
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from queue import Empty, Queue
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -32,6 +33,8 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.formparsers import MultiPartParser
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from litserve import LitAPI
 from litserve.connector import _Connector
@@ -77,6 +80,7 @@ def collate_requests(
     timed_out_uids = []
     entered_at = time.monotonic()
     end_time = entered_at + batch_timeout
+    apply_timeout = lit_api.request_timeout not in (-1, False)
 
     while time.monotonic() < end_time and len(payloads) < max_batch_size:
         remaining_time = end_time - time.monotonic()
@@ -85,10 +89,11 @@ def collate_requests(
 
         try:
             uid, timestamp, x_enc = request_queue.get(timeout=min(remaining_time, 0.001))
-            if time.monotonic() - timestamp <= lit_api.request_timeout:
-                payloads.append((uid, timestamp, x_enc))
-            else:
+            if apply_timeout and time.monotonic() - timestamp > lit_api.request_timeout:
                 timed_out_uids.append(uid)
+            else:
+                payloads.append((uid, x_enc))
+
         except Empty:
             continue
 
@@ -169,7 +174,7 @@ def run_batched_loop(
         if not batches:
             continue
         logger.debug(f"{len(batches)} batched requests received")
-        uids, _, inputs = zip(*batches)
+        uids, inputs = zip(*batches)
         try:
             contexts = [{}] * len(inputs)
             if hasattr(lit_spec, "populate_context"):
@@ -278,7 +283,7 @@ def run_batched_streaming_loop(
 
         if not batches:
             continue
-        uids, _, inputs = zip(*batches)
+        uids, inputs = zip(*batches)
         try:
             contexts = [{}] * len(inputs)
             if hasattr(lit_spec, "populate_context"):
@@ -326,9 +331,12 @@ def inference_worker(
     max_batch_size: int,
     batch_timeout: float,
     stream: bool,
+    workers_setup_status: Dict[str, bool] = None,
 ):
     lit_api.setup(device)
     lit_api.device = device
+    if workers_setup_status:
+        workers_setup_status[worker_id] = True
     message = f"Setup complete for worker {worker_id}."
     print(message)
     logger.info(message)
@@ -364,12 +372,16 @@ def api_key_auth(x_api_key: str = Depends(APIKeyHeader(name="X-API-Key"))):
 
 
 async def response_queue_to_buffer(
-    response_queue: mp.Queue, buffer: Dict[str, Union[Tuple[deque, asyncio.Event], asyncio.Event]], stream: bool
+    response_queue: mp.Queue,
+    buffer: Dict[str, Union[Tuple[deque, asyncio.Event], asyncio.Event]],
+    stream: bool,
+    response_executor: ThreadPoolExecutor,
 ):
+    loop = asyncio.get_running_loop()
     if stream:
         while True:
             try:
-                uid, payload = response_queue.get_nowait()
+                uid, payload = await loop.run_in_executor(response_executor, response_queue.get)
             except Empty:
                 await asyncio.sleep(0.0001)
                 continue
@@ -380,7 +392,7 @@ async def response_queue_to_buffer(
     else:
         while True:
             try:
-                uid, payload = response_queue.get_nowait()
+                uid, payload = await loop.run_in_executor(response_executor, response_queue.get)
             except Empty:
                 await asyncio.sleep(0.0001)
                 continue
@@ -402,6 +414,7 @@ class LitServer:
         api_path: str = "/predict",
         stream: bool = False,
         spec: Optional[LitSpec] = None,
+        max_payload_size=None,
     ):
         if batch_timeout > timeout and timeout not in (False, -1):
             raise ValueError("batch_timeout must be less than timeout")
@@ -424,6 +437,8 @@ class LitServer:
         # gzip does not play nicely with streaming, see https://github.com/tiangolo/fastapi/discussions/8448
         if not stream:
             self.app.add_middleware(GZipMiddleware, minimum_size=1000)
+        if max_payload_size is not None:
+            self.app.add_middleware(MaxSizeMiddleware, max_size=max_payload_size)
         self.lit_api = lit_api
         self.lit_spec = spec
         self.workers_per_device = workers_per_device
@@ -464,9 +479,15 @@ class LitServer:
         manager = mp.Manager()
         self.request_queue = manager.Queue()
         self.response_buffer = {}
+        self.workers_setup_status = manager.dict()
 
         response_queues = []
-        tasks = []
+        tasks: List[asyncio.Task] = []
+
+        def close_tasks():
+            for task in tasks:
+                task.cancel()
+            response_executor.shutdown(wait=False, cancel_futures=True)
 
         try:
             pickle.dumps(self.lit_api)
@@ -481,6 +502,7 @@ class LitServer:
             raise e
 
         loop = asyncio.get_running_loop()
+        response_executor = ThreadPoolExecutor(max_workers=len(self.devices * self.workers_per_device))
 
         process_list = []
         # NOTE: device: str | List[str], the latter in the case a model needs more than one device to run
@@ -488,10 +510,12 @@ class LitServer:
             if len(device) == 1:
                 device = device[0]
 
+            self.workers_setup_status[worker_id] = False
             response_queue = manager.Queue()
             response_queues.append(response_queue)
 
-            task = loop.create_task(response_queue_to_buffer(response_queue, self.response_buffer, self.stream))
+            future = response_queue_to_buffer(response_queue, self.response_buffer, self.stream, response_executor)
+            task = loop.create_task(future, name=f"Response-reader-{worker_id}")
             tasks.append(task)
 
             ctx = mp.get_context("spawn")
@@ -507,6 +531,7 @@ class LitServer:
                     self.max_batch_size,
                     self.batch_timeout,
                     self.stream,
+                    self.workers_setup_status,
                 ),
                 daemon=True,
             )
@@ -518,14 +543,19 @@ class LitServer:
             logging.debug(f"shallow copy for Server is created for for spec {spec}")
             server_copy = copy.copy(self)
             del server_copy.app
-            spec.setup(server_copy)
+            try:
+                spec.setup(server_copy)
+            except Exception as e:
+                close_tasks()
+                raise e
 
         yield
 
-        manager.shutdown()
+        close_tasks()
         for process, worker_id in process_list:
             logging.info(f"terminating worker worker_id={worker_id}")
             process.terminate()
+        manager.shutdown()
 
     def device_identifiers(self, accelerator, device):
         if isinstance(device, Sequence):
@@ -555,9 +585,22 @@ class LitServer:
             data_available.clear()
 
     def setup_server(self):
+        workers_ready = False
+
         @self.app.get("/", dependencies=[Depends(self.setup_auth())])
         async def index(request: Request) -> Response:
             return Response(content="litserve running")
+
+        @self.app.get("/health", dependencies=[Depends(self.setup_auth())])
+        async def health(request: Request) -> Response:
+            nonlocal workers_ready
+            if not workers_ready:
+                workers_ready = all(self.workers_setup_status.values())
+
+            if workers_ready:
+                return Response(content="ok", status_code=200)
+
+            return Response(content="not ready", status_code=503)
 
         async def predict(request: self.request_type, background_tasks: BackgroundTasks) -> self.response_type:
             uid = uuid.uuid4()
@@ -653,3 +696,32 @@ class LitServer:
         if LIT_SERVER_API_KEY:
             return api_key_auth
         return no_auth
+
+
+class MaxSizeMiddleware(BaseHTTPMiddleware):
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_size: Optional[int] = None,
+    ) -> None:
+        self.app = app
+        self.max_size = max_size
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        total_size = 0
+
+        async def rcv() -> Message:
+            nonlocal total_size
+            message = await receive()
+            chunk_size = len(message.get("body", b""))
+            total_size += chunk_size
+            if self.max_size is not None and total_size > self.max_size:
+                raise HTTPException(413, "Payload too large")
+            return message
+
+        await self.app(scope, rcv, send)
